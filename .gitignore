@@ -1,0 +1,16 @@
+*.iml
+.gradle/
+.idea/
+local.properties
+build/
+app/build/
+app/third_party/whisper.cpp/
+*.apk
+*.bin
+
+# Never commit Whisper models or APK build outputs
+*.bin
+*.gguf
+*.apk
+*.aab
+app/third_party/

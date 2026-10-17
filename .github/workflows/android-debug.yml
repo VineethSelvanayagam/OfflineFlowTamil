@@ -1,0 +1,59 @@
+name: Android Offline Flow Tamil — Debug APK
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout app source
+        uses: actions/checkout@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install SDK platform, NDK and CMake
+        run: |
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.3.11579264' 'cmake;3.22.1'
+      - name: Install Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Verify application source and privacy setup
+        run: python3 tools/source_checks.py
+      - name: Fetch Whisper engine source on build runner
+        run: bash setup_native_macos_linux.sh
+      - name: Build ARM64 debug APK with JNI native library
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+      - name: Confirm APK contains Whisper JNI and no INTERNET permission
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          unzip -l "$APK" | tee /tmp/offlineflow-apk-list.txt
+          grep -Fq 'lib/arm64-v8a/libofflinewhisper.so' /tmp/offlineflow-apk-list.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump permissions "$APK" | tee /tmp/offlineflow-apk-permissions.txt
+          if grep -Fq 'android.permission.INTERNET' /tmp/offlineflow-apk-permissions.txt; then
+            echo 'FAIL: APK must not have INTERNET permission'; exit 1
+          fi
+          grep -Fq 'android.permission.RECORD_AUDIO' /tmp/offlineflow-apk-permissions.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.offlineflow.tamil'"
+      - name: Publish DEBUG APK artifact (not device-tested)
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfflineFlowTamil-v0.7-UNTESTED-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
