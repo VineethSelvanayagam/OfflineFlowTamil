@@ -21,10 +21,24 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Install Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install SDK platform, NDK and CMake
+      # GitHub-hosted Ubuntu runners already provide an Android SDK. The
+      # setup-android@v3 action currently tries to install the retired "tools"
+      # package, causing this workflow to fail before Gradle can start.
+      - name: Locate runner Android SDK
+        shell: bash
         run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?ANDROID_HOME is missing on this GitHub runner}"
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
+          test -n "$SDKMANAGER"
+          test -x "$SDKMANAGER"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "Using $SDKMANAGER"
+          "$SDKMANAGER" --version
+      - name: Install SDK platform, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
           sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.3.11579264' 'cmake;3.22.1'
       - name: Install Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
