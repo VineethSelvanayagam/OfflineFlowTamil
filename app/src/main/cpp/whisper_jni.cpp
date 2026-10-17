@@ -1,5 +1,7 @@
 #include <jni.h>
 #include <android/log.h>
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 #include "whisper.h"
@@ -13,19 +15,19 @@ Java_com_offlineflow_tamil_WhisperBridge_nativeLoad(
     std::string path(raw);
     env->ReleaseStringUTFChars(jpath, raw);
     whisper_context_params contextParams = whisper_context_default_params();
-    contextParams.use_gpu = false; // CPU-only: work on Android without a GPU backend.
+    contextParams.use_gpu = false; // Runs offline on ARM64 CPUs.
     whisper_context *context = whisper_init_from_file_with_params(path.c_str(), contextParams);
     if (context && !whisper_is_multilingual(context)) {
         __android_log_print(ANDROID_LOG_WARN, "OfflineFlowTamil",
-            "Selected model is English-only, but multilingual Tamil support is required");
+            "English-only model rejected; multilingual model is required");
         whisper_free(context);
         return 0;
     }
     return reinterpret_cast<jlong>(context);
 }
 
-// Return ordinary UTF-8 as a byte array: NewStringUTF uses *modified* UTF-8,
-// which does not accept all four-byte Unicode sequences (e.g., emoji).
+// Ordinary UTF-8 in a byte array preserves the full Unicode range,
+// including Tamil script and emoji; JNI modified UTF-8 is not suitable.
 static jbyteArray makeUtf8Bytes(JNIEnv *env, const std::string &value) {
     jbyteArray arr = env->NewByteArray(static_cast<jsize>(value.size()));
     if (!arr) return nullptr;
@@ -34,6 +36,57 @@ static jbyteArray makeUtf8Bytes(JNIEnv *env, const std::string &value) {
                                 reinterpret_cast<const jbyte *>(value.data()));
     }
     return arr;
+}
+
+struct RecognitionCandidate {
+    std::string text;
+    double avgLogProbability = -100.0;
+    int scoredTokens = 0;
+};
+
+static RecognitionCandidate recognizeInLanguage(
+    whisper_context *context, const std::vector<float> &samples,
+    const char *language) {
+    RecognitionCandidate candidate;
+    // Beam search is a measured quality/speed tradeoff to test on phones.
+    whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);
+    params.language = language;
+    params.beam_search.beam_size = 3;
+    params.n_threads = 4;
+    params.no_context = true;
+    params.no_timestamps = true;
+    params.translate = false;
+    params.suppress_nst = true;
+    params.print_realtime = false;
+    params.print_progress = false;
+    params.print_timestamps = false;
+    params.print_special = false;
+    if (whisper_full(context, params, samples.data(),
+                     static_cast<int>(samples.size())) != 0) {
+        return candidate;
+    }
+
+    const int segments = whisper_full_n_segments(context);
+    const whisper_token eot = whisper_token_eot(context);
+    double logProbabilitySum = 0.0;
+    for (int i = 0; i < segments; ++i) {
+        const char *segment = whisper_full_get_segment_text(context, i);
+        if (segment) candidate.text += segment;
+        const int tokens = whisper_full_n_tokens(context, i);
+        for (int j = 0; j < tokens; ++j) {
+            const whisper_token tokenId = whisper_full_get_token_id(context, i, j);
+            // Only score ordinary text tokens, not EOT/language/task markers.
+            if (tokenId >= eot) continue;
+            const float p = whisper_full_get_token_p(context, i, j);
+            if (!std::isfinite(p) || p <= 0.f) continue;
+            logProbabilitySum += std::log(std::max(0.000001f, p));
+            candidate.scoredTokens++;
+        }
+    }
+    if (candidate.scoredTokens > 0) {
+        candidate.avgLogProbability = logProbabilitySum / candidate.scoredTokens;
+    }
+    return candidate;
 }
 
 extern "C" JNIEXPORT jbyteArray JNICALL
@@ -46,32 +99,35 @@ Java_com_offlineflow_tamil_WhisperBridge_nativeTranscribeUtf8(
     if (length < 8000 || length > (16000 * 25)) return makeUtf8Bytes(env, "");
     std::vector<float> samples(static_cast<size_t>(length));
     env->GetFloatArrayRegion(jaudio, 0, length, samples.data());
+    if (env->ExceptionCheck()) return nullptr;
     const char *raw = env->GetStringUTFChars(jlanguage, nullptr);
     if (!raw) return makeUtf8Bytes(env, "");
     std::string language(raw);
     env->ReleaseStringUTFChars(jlanguage, raw);
 
-    whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    params.language = language.c_str();
-    params.n_threads = 4;
-    params.no_context = true;
-    params.no_timestamps = true;
-    params.translate = false; // Separate snippets must not leak earlier dictation context.
-    params.single_segment = false;
-    params.print_realtime = false;
-    params.print_progress = false;
-    params.print_timestamps = false;
-    params.print_special = false;
-    int result = whisper_full(context, params, samples.data(), static_cast<int>(samples.size()));
-    if (result != 0) return makeUtf8Bytes(env, "");
-
-    std::string text;
-    int segments = whisper_full_n_segments(context);
-    for (int i = 0; i < segments; i++) {
-        const char *segment = whisper_full_get_segment_text(context, i);
-        if (segment) text += segment;
+    if (language == "en" || language == "ta") {
+        return makeUtf8Bytes(env, recognizeInLanguage(
+            context, samples, language.c_str()).text);
     }
-    return makeUtf8Bytes(env, text);
+    if (language != "auto") return makeUtf8Bytes(env, "");
+
+    // v0.7 passed "auto" directly to Whisper, which can misclassify
+    // English as Tamil on short clips. In auto mode, constrain choices to
+    // English and Tamil, decoding both, then compare mean text-token confidence.
+    // Each pass resets context, and decoded text NEVER goes to logcat.
+    const RecognitionCandidate english = recognizeInLanguage(context, samples, "en");
+    const RecognitionCandidate tamil = recognizeInLanguage(context, samples, "ta");
+    bool useEnglish = false;
+    if (tamil.text.empty()) {
+        useEnglish = true;
+    } else if (!english.text.empty()) {
+        useEnglish = english.avgLogProbability >= tamil.avgLogProbability;
+    }
+    const RecognitionCandidate &chosen = useEnglish ? english : tamil;
+    __android_log_print(ANDROID_LOG_INFO, "OfflineFlowTamil",
+        "Auto language compared local candidates; selected %s (scores hidden)",
+        useEnglish ? "en" : "ta");
+    return makeUtf8Bytes(env, chosen.text);
 }
 
 extern "C" JNIEXPORT void JNICALL
